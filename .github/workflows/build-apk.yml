@@ -1,0 +1,55 @@
+name: Build InkErase Offline Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Prepare Offline Web & Neural Model Assets
+        run: |
+          mkdir -p www
+          cp -r index.html style.css app.js manifest.json icon-512.png fonts sw.js lama_int8.onnx ort www/ 2>/dev/null || true
+          ls -lh www/
+
+      - name: Install Dependencies & Init Capacitor
+        run: |
+          npm init -y
+          npm install @capacitor/core@latest @capacitor/cli@latest @capacitor/android@latest
+          npx cap add android
+          npx cap sync
+
+      - name: Build APK with Gradle
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Locate and Rename APK
+        run: |
+          find android/app/build/outputs/apk -name "*.apk" -exec cp {} InkErase-Offline.apk \;
+          ls -lh InkErase-Offline.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: InkErase-Offline-APK
+          path: InkErase-Offline.apk
