@@ -207,6 +207,8 @@
   let isDrawing = false;
   let lastX = 0;
   let lastY = 0;
+  let eraseBrushRadius = parseInt(brushSizeInput.value, 10);
+
   // On-Device Neural Inpainting Engine (100% Offline via WebAssembly / WebGPU)
   let lamaSession = null;
   let isLamaLoading = false;
@@ -225,8 +227,9 @@
       if (typeof ort === 'undefined') {
         throw new Error('ONNX Runtime Web library not detected.');
       }
-      ort.env.wasm.wasmPaths = 'ort/';
-      ort.env.wasm.numThreads = Math.min(2, navigator.hardwareConcurrency || 1);
+      const baseUrl = window.location.href.substring(0, window.location.href.lastIndexOf('/') + 1) + 'ort/';
+      ort.env.wasm.wasmPaths = baseUrl;
+      ort.env.wasm.numThreads = 1;
 
       lamaSession = await ort.InferenceSession.create('lama_int8.onnx', {
         executionProviders: ['wasm'],
@@ -243,11 +246,6 @@
       showProgress(false);
     }
   }
-
-  // Pre-warm on-device AI in background on startup
-  setTimeout(() => {
-    getOfflineLamaSession().catch(() => {});
-  }, 1000);
 
   if (gpuStatusText) gpuStatusText.textContent = '⚡ 100% Offline AI';
 
