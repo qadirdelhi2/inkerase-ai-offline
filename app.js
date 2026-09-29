@@ -1789,7 +1789,7 @@
   }
 
   // ==========================================
-  // 7. On-Device Smart Skin Synthesis Inpainting Engine (100% Offline)
+  // 7. Ultra-Realistic On-Device Skin Inpainting Engine (100% Offline)
   // ==========================================
   function runOnDeviceSkinInpaint(cropX1, cropY1, cropW, cropH) {
     const baseDataObj = baseCtx.getImageData(cropX1, cropY1, cropW, cropH);
@@ -1811,151 +1811,89 @@
     const numMasked = maskedIndices.length;
     if (numMasked === 0) return;
 
-    // 2. Identify surrounding healthy skin ring (radius 4 to 14 px outside mask)
-    const dilatedRing = new Uint8Array(total);
-    for (let k = 0; k < numMasked; k++) {
-      const idx = maskedIndices[k];
-      const mx = idx % W;
-      const my = Math.floor(idx / W);
-      for (let dy = -12; dy <= 12; dy += 2) {
-        const ny = my + dy;
-        if (ny < 0 || ny >= H) continue;
-        const yOffset = ny * W;
-        for (let dx = -12; dx <= 12; dx += 2) {
-          const nx = mx + dx;
-          if (nx < 0 || nx >= W) continue;
-          const distSq = dx * dx + dy * dy;
-          if (distSq >= 16 && distSq <= 144) {
-            const nIdx = yOffset + nx;
-            if (!isMask[nIdx]) {
-              dilatedRing[nIdx] = 1;
-            }
-          }
-        }
-      }
-    }
+    // 2. Sample surrounding clean skin (skipping leftover dark tattoo ink)
+    const dirs = [
+      [-1, 0], [1, 0], [0, -1], [0, 1],
+      [-1, -1], [1, -1], [-1, 1], [1, 1]
+    ];
 
-    const borderX = [];
-    const borderY = [];
-    const borderR = [];
-    const borderG = [];
-    const borderB = [];
-    let sumR = 0, sumG = 0, sumB = 0, sampleCount = 0;
-
-    for (let i = 0; i < total; i++) {
-      if (dilatedRing[i]) {
-        const p = i * 4;
-        const r = d[p];
-        const g = d[p + 1];
-        const b = d[p + 2];
-        borderX.push(i % W);
-        borderY.push(Math.floor(i / W));
-        borderR.push(r);
-        borderG.push(g);
-        borderB.push(b);
-        sumR += r;
-        sumG += g;
-        sumB += b;
-        sampleCount++;
-      }
-    }
-
-    // Fallback if not enough samples from concentric ring
-    if (sampleCount < 10) {
-      for (let i = 0; i < total; i++) {
-        if (!isMask[i]) {
-          const p = i * 4;
-          const r = d[p];
-          const g = d[p + 1];
-          const b = d[p + 2];
-          borderX.push(i % W);
-          borderY.push(Math.floor(i / W));
-          borderR.push(r);
-          borderG.push(g);
-          borderB.push(b);
-          sumR += r;
-          sumG += g;
-          sumB += b;
-          sampleCount++;
-          if (sampleCount > 250) break;
-        }
-      }
-    }
-
-    const meanR = sampleCount > 0 ? (sumR / sampleCount) : 210;
-    const meanG = sampleCount > 0 ? (sumG / sampleCount) : 170;
-    const meanB = sampleCount > 0 ? (sumB / sampleCount) : 150;
-
-    // 3. Compute spatial 2D lighting gradient plane across the skin
-    let meanX = 0, meanY = 0;
-    for (let i = 0; i < sampleCount; i++) {
-      meanX += borderX[i];
-      meanY += borderY[i];
-    }
-    meanX /= Math.max(1, sampleCount);
-    meanY /= Math.max(1, sampleCount);
-
-    let sxx = 0, syy = 0, sxy = 0;
-    let sxr = 0, syr = 0;
-    let sxg = 0, syg = 0;
-    let sxb = 0, syb = 0;
-
-    for (let i = 0; i < sampleCount; i++) {
-      const dx = borderX[i] - meanX;
-      const dy = borderY[i] - meanY;
-      sxx += dx * dx;
-      syy += dy * dy;
-      sxy += dx * dy;
-      sxr += dx * (borderR[i] - meanR);
-      syr += dy * (borderR[i] - meanR);
-      sxg += dx * (borderG[i] - meanG);
-      syg += dy * (borderG[i] - meanG);
-      sxb += dx * (borderB[i] - meanB);
-      syb += dy * (borderB[i] - meanB);
-    }
-
-    const det = (sxx * syy - sxy * sxy) || 1e-6;
-    const gradRx = Math.max(-0.5, Math.min(0.5, (syy * sxr - sxy * syr) / det));
-    const gradRy = Math.max(-0.5, Math.min(0.5, (sxx * syr - sxy * sxr) / det));
-    const gradGx = Math.max(-0.5, Math.min(0.5, (syy * sxg - sxy * syg) / det));
-    const gradGy = Math.max(-0.5, Math.min(0.5, (sxx * syg - sxy * sxg) / det));
-    const gradBx = Math.max(-0.5, Math.min(0.5, (syy * sxb - sxy * syb) / det));
-    const gradBy = Math.max(-0.5, Math.min(0.5, (sxx * syb - sxy * sxb) / det));
-
-    // 4. Sample skin texture standard deviation (natural pores & sensor grain)
-    let lumVarSum = 0;
-    for (let i = 0; i < sampleCount; i++) {
-      const lum = 0.299 * borderR[i] + 0.587 * borderG[i] + 0.114 * borderB[i];
-      const targetLum = 0.299 * meanR + 0.587 * meanG + 0.114 * meanB;
-      lumVarSum += (lum - targetLum) * (lum - targetLum);
-    }
-    const skinNoiseStd = Math.min(10.0, Math.max(2.5, Math.sqrt(lumVarSum / Math.max(1, sampleCount))));
-
-    // 5. Initialize working float buffers with spatial gradient fill
     const bufR = new Float32Array(total);
     const bufG = new Float32Array(total);
     const bufB = new Float32Array(total);
 
     for (let i = 0; i < total; i++) {
       const p = i * 4;
-      if (!isMask[i]) {
-        bufR[i] = d[p];
-        bufG[i] = d[p + 1];
-        bufB[i] = d[p + 2];
-      } else {
-        const px = i % W;
-        const py = Math.floor(i / W);
-        bufR[i] = Math.max(0, Math.min(255, meanR + gradRx * (px - meanX) + gradRy * (py - meanY)));
-        bufG[i] = Math.max(0, Math.min(255, meanG + gradGx * (px - meanX) + gradGy * (py - meanY)));
-        bufB[i] = Math.max(0, Math.min(255, meanB + gradBx * (px - meanX) + gradBy * (py - meanY)));
+      bufR[i] = d[p];
+      bufG[i] = d[p + 1];
+      bufB[i] = d[p + 2];
+    }
+
+    const skinSamplesR = [];
+    const skinSamplesG = [];
+    const skinSamplesB = [];
+
+    // Ray march in 8 directions to initialize harmonic field
+    const maxRay = Math.max(60, Math.ceil(Math.hypot(W, H) * 0.6));
+    for (let k = 0; k < numMasked; k++) {
+      const idx = maskedIndices[k];
+      const px = idx % W;
+      const py = Math.floor(idx / W);
+
+      let wSum = 0, rSum = 0, gSum = 0, bSum = 0;
+      for (let dIdx = 0; dIdx < 8; dIdx++) {
+        const dx = dirs[dIdx][0];
+        const dy = dirs[dIdx][1];
+        let step = 1;
+        while (step < maxRay) {
+          const nx = px + dx * step;
+          const ny = py + dy * step;
+          if (nx < 0 || nx >= W || ny < 0 || ny >= H) break;
+          const nIdx = ny * W + nx;
+          if (!isMask[nIdx]) {
+            // Step 2-4px further into healthy skin to avoid dark tattoo ink edges
+            const safeStep = step + 3;
+            let safeX = px + dx * safeStep;
+            let safeY = py + dy * safeStep;
+            if (safeX < 0 || safeX >= W || safeY < 0 || safeY >= H) {
+              safeX = nx;
+              safeY = ny;
+            }
+            const sIdx = (safeY * W + safeX) * 4;
+            const dist = Math.hypot(safeX - px, safeY - py) || 1;
+            const weight = 1.0 / (dist * dist);
+
+            const r = d[sIdx];
+            const g = d[sIdx + 1];
+            const b = d[sIdx + 2];
+
+            rSum += r * weight;
+            gSum += g * weight;
+            bSum += b * weight;
+            wSum += weight;
+
+            if (skinSamplesR.length < 500) {
+              skinSamplesR.push(r);
+              skinSamplesG.push(g);
+              skinSamplesB.push(b);
+            }
+            break;
+          }
+          step++;
+        }
+      }
+
+      if (wSum > 0) {
+        bufR[idx] = rSum / wSum;
+        bufG[idx] = gSum / wSum;
+        bufB[idx] = bSum / wSum;
       }
     }
 
-    // 6. Fast iterative Laplacian PDE relaxation (propagating real boundary colors inward)
+    // 3. Multi-pass Laplacian PDE smoothing
     const nextR = new Float32Array(bufR);
     const nextG = new Float32Array(bufG);
     const nextB = new Float32Array(bufB);
-    const passes = Math.min(55, Math.max(30, Math.round(Math.sqrt(numMasked) * 0.5)));
+    const passes = Math.min(45, Math.max(25, Math.round(Math.sqrt(numMasked) * 0.4)));
 
     for (let it = 0; it < passes; it++) {
       for (let k = 0; k < numMasked; k++) {
@@ -1981,7 +1919,24 @@
       }
     }
 
-    // 7. Multi-pass Feathered Gaussian Alpha Map for Seamless Blending
+    // 4. Sample skin texture standard deviation (pores & sensor grain)
+    let skinNoiseStd = 4.5;
+    if (skinSamplesR.length > 10) {
+      let lumSum = 0;
+      const count = skinSamplesR.length;
+      for (let i = 0; i < count; i++) {
+        lumSum += 0.299 * skinSamplesR[i] + 0.587 * skinSamplesG[i] + 0.114 * skinSamplesB[i];
+      }
+      const meanLum = lumSum / count;
+      let varSum = 0;
+      for (let i = 0; i < count; i++) {
+        const lum = 0.299 * skinSamplesR[i] + 0.587 * skinSamplesG[i] + 0.114 * skinSamplesB[i];
+        varSum += (lum - meanLum) * (lum - meanLum);
+      }
+      skinNoiseStd = Math.min(9.0, Math.max(2.5, Math.sqrt(varSum / count)));
+    }
+
+    // 5. Multi-pass Feathered Alpha Map for Seamless Blending
     const alphaMap = new Float32Array(total);
     for (let k = 0; k < numMasked; k++) {
       alphaMap[maskedIndices[k]] = 1.0;
@@ -2002,14 +1957,17 @@
       alphaMap.set(tempAlpha);
     }
 
-    // 8. Composite with Organic Skin Pore Grain
+    // 6. Write Synthesized Skin with Hermite feathering and Organic Micro-Pore Grain
     for (let y = 0; y < H; y++) {
       const yOffset = y * W;
       for (let x = 0; x < W; x++) {
         const idx = yOffset + x;
-        const a = alphaMap[idx];
-        if (a > 0.005) {
+        const rawA = alphaMap[idx];
+        if (rawA > 0.005) {
+          // Smooth Hermite S-curve blending (zero visible seam)
+          const a = rawA * rawA * (3.0 - 2.0 * rawA);
           const p = idx * 4;
+
           const u1 = Math.max(0.0001, Math.random());
           const u2 = Math.random();
           const noise = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2) * skinNoiseStd * 0.55;
