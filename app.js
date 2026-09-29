@@ -543,11 +543,31 @@
   }
 
   // Multi-Touch Focal-Point Pinch Zoom + 2-Finger Pan + Single-Finger Drawing
+  let lastPinchEndTime = 0;
+  let pendingTouchStart = null;
+  let pendingTouchTimer = null;
+  let currentStrokePoints = [];
+
   canvasViewport.addEventListener('touchstart', (e) => {
-    if (e.touches.length === 2) {
-      if (isDrawing) {
-        stopInteraction();
+    if (e.touches.length >= 2) {
+      // 2 fingers detected: IMMEDIATELY cancel any pending or active drawing!
+      if (pendingTouchTimer) {
+        clearTimeout(pendingTouchTimer);
+        pendingTouchTimer = null;
       }
+      pendingTouchStart = null;
+
+      if (isDrawing) {
+        // If an accidental stroke dot was placed by finger 1 before finger 2 landed, revert it immediately!
+        if (activeTool === 'erase' && maskStrokeHistory.length > 0) {
+          const prevState = maskStrokeHistory.pop();
+          maskCtx.putImageData(prevState, 0, 0);
+          updateUndoState();
+        }
+        isDrawing = false;
+        currentStrokePoints = [];
+      }
+
       isPinching = true;
       cursorCtx.clearRect(0, 0, cursorCanvas.width, cursorCanvas.height);
 
@@ -561,51 +581,118 @@
         x: (t1.clientX + t2.clientX) / 2,
         y: (t1.clientY + t2.clientY) / 2
       };
-    } else if (e.touches.length === 1 && !isPinching) {
+      e.preventDefault();
+      return;
+    }
+
+    if (e.touches.length === 1) {
+      // If we just finished a 2-finger gesture within the last 400ms, ignore trailing release touches
+      if (Date.now() - lastPinchEndTime < 400 || isPinching) {
+        e.preventDefault();
+        return;
+      }
+
       if (activeTool !== 'text') e.preventDefault();
-      startInteraction(e.touches[0].clientX, e.touches[0].clientY);
+
+      const clientX = e.touches[0].clientX;
+      const clientY = e.touches[0].clientY;
+      pendingTouchStart = { clientX, clientY };
+
+      if (pendingTouchTimer) clearTimeout(pendingTouchTimer);
+      // Short 40ms buffer to check if a second finger is landing for pinch zoom
+      pendingTouchTimer = setTimeout(() => {
+        if (pendingTouchStart && !isPinching && Date.now() - lastPinchEndTime >= 400) {
+          startInteraction(pendingTouchStart.clientX, pendingTouchStart.clientY);
+          pendingTouchStart = null;
+        }
+      }, 40);
     }
   }, { passive: false });
 
   canvasViewport.addEventListener('touchmove', (e) => {
-    if (isPinching && e.touches.length === 2) {
+    if (e.touches.length >= 2 || isPinching) {
       e.preventDefault();
-      const t1 = e.touches[0];
-      const t2 = e.touches[1];
-      const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
-      const currentMid = {
-        x: (t1.clientX + t2.clientX) / 2,
-        y: (t1.clientY + t2.clientY) / 2
-      };
-
-      if (startPinchDist > 5) {
-        const factor = dist / startPinchDist;
-        const newScale = Math.min(8.0, Math.max(0.75, startScale * factor));
-
-        // True focal point zoom & pan: keeping image directly anchored under fingers
-        panX = currentMid.x - ((pinchMidpoint.x - startPanX) / startScale) * newScale;
-        panY = currentMid.y - ((pinchMidpoint.y - startPanY) / startScale) * newScale;
-        scale = newScale;
-
-        clampPan(canvasViewport.clientWidth, canvasViewport.clientHeight);
-        updateTransform();
+      if (pendingTouchTimer) {
+        clearTimeout(pendingTouchTimer);
+        pendingTouchTimer = null;
       }
-    } else if (!isPinching && isDrawing && e.touches.length === 1) {
+      pendingTouchStart = null;
+
+      if (isDrawing) {
+        if (activeTool === 'erase' && maskStrokeHistory.length > 0) {
+          const prevState = maskStrokeHistory.pop();
+          maskCtx.putImageData(prevState, 0, 0);
+          updateUndoState();
+        }
+        isDrawing = false;
+        currentStrokePoints = [];
+      }
+
+      if (e.touches.length >= 2) {
+        const t1 = e.touches[0];
+        const t2 = e.touches[1];
+        const dist = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+        const currentMid = {
+          x: (t1.clientX + t2.clientX) / 2,
+          y: (t1.clientY + t2.clientY) / 2
+        };
+
+        if (startPinchDist > 5) {
+          const factor = dist / startPinchDist;
+          const newScale = Math.min(8.0, Math.max(0.75, startScale * factor));
+
+          // True focal point zoom & pan: keeping image directly anchored under fingers
+          panX = currentMid.x - ((pinchMidpoint.x - startPanX) / startScale) * newScale;
+          panY = currentMid.y - ((pinchMidpoint.y - startPanY) / startScale) * newScale;
+          scale = newScale;
+
+          clampPan(canvasViewport.clientWidth, canvasViewport.clientHeight);
+          updateTransform();
+        }
+      }
+      return;
+    }
+
+    if (e.touches.length === 1 && !isPinching && Date.now() - lastPinchEndTime >= 400) {
       e.preventDefault();
-      moveInteraction(e.touches[0].clientX, e.touches[0].clientY);
+      const clientX = e.touches[0].clientX;
+      const clientY = e.touches[0].clientY;
+
+      if (pendingTouchStart) {
+        // Finger moved before 40ms expired - definitely an intentional drawing stroke!
+        clearTimeout(pendingTouchTimer);
+        pendingTouchTimer = null;
+        startInteraction(pendingTouchStart.clientX, pendingTouchStart.clientY);
+        pendingTouchStart = null;
+      }
+
+      if (isDrawing) {
+        moveInteraction(clientX, clientY);
+      }
     }
   }, { passive: false });
 
   canvasViewport.addEventListener('touchend', (e) => {
-    if (e.touches.length < 2 && isPinching) {
-      isPinching = false;
-      if (scale < 0.96) {
-        fitCanvasToCurrentViewport();
-      } else {
-        clampPan(canvasViewport.clientWidth, canvasViewport.clientHeight);
-        updateTransform();
-      }
+    if (pendingTouchTimer) {
+      clearTimeout(pendingTouchTimer);
+      pendingTouchTimer = null;
     }
+    pendingTouchStart = null;
+
+    if (isPinching) {
+      if (e.touches.length === 0) {
+        isPinching = false;
+        lastPinchEndTime = Date.now();
+        if (scale < 0.96) {
+          fitCanvasToCurrentViewport();
+        } else {
+          clampPan(canvasViewport.clientWidth, canvasViewport.clientHeight);
+          updateTransform();
+        }
+      }
+      return;
+    }
+
     if (e.touches.length === 0) {
       stopInteraction();
     }
@@ -648,15 +735,16 @@
     lastX = coords.x;
     lastY = coords.y;
     isDrawing = true;
+    currentStrokePoints = [coords];
 
     let activeRadius = eraseBrushRadius;
     if (activeTool === 'brushblur') activeRadius = manualBrushRadius;
     else if (activeTool === 'skinsmooth') activeRadius = skinSmoothRadius;
-    drawCursor(coords.x, coords.y, activeRadius);
+    drawCursor(coords.x, coords.y, activeRadius, true);
 
     if (activeTool === 'erase') {
       saveMaskStroke();
-      drawEraseStroke(lastX, lastY, lastX, lastY);
+      drawEraseDot(coords.x, coords.y);
     } else if (activeTool === 'brushblur') {
       saveImageState();
       prepareBlurSource();
@@ -676,17 +764,30 @@
 
     const coords = getCanvasCoords(clientX, clientY);
 
-    // Update cursor circle
     let activeRadius = eraseBrushRadius;
     if (activeTool === 'brushblur') activeRadius = manualBrushRadius;
     else if (activeTool === 'skinsmooth') activeRadius = skinSmoothRadius;
 
-    drawCursor(coords.x, coords.y, activeRadius);
+    drawCursor(coords.x, coords.y, activeRadius, true);
 
     if (!isDrawing || !currentWorkingImage || isComparing) return;
 
     if (activeTool === 'erase') {
-      drawEraseStroke(lastX, lastY, coords.x, coords.y);
+      currentStrokePoints.push(coords);
+      if (currentStrokePoints.length >= 3) {
+        const p0 = currentStrokePoints[currentStrokePoints.length - 3];
+        const p1 = currentStrokePoints[currentStrokePoints.length - 2];
+        const p2 = currentStrokePoints[currentStrokePoints.length - 1];
+
+        const mid1X = (p0.x + p1.x) / 2;
+        const mid1Y = (p0.y + p1.y) / 2;
+        const mid2X = (p1.x + p2.x) / 2;
+        const mid2Y = (p1.y + p2.y) / 2;
+
+        drawEraseCurve(mid1X, mid1Y, p1.x, p1.y, mid2X, mid2Y);
+      } else if (currentStrokePoints.length === 2) {
+        drawEraseStroke(currentStrokePoints[0].x, currentStrokePoints[0].y, currentStrokePoints[1].x, currentStrokePoints[1].y);
+      }
       lastX = coords.x;
       lastY = coords.y;
     } else if (activeTool === 'brushblur') {
@@ -703,6 +804,7 @@
   function stopInteraction() {
     if (!isDrawing) return;
     isDrawing = false;
+    currentStrokePoints = [];
     setTimeout(() => {
       if (!isDrawing) cursorCtx.clearRect(0, 0, cursorCanvas.width, cursorCanvas.height);
     }, 450);
@@ -735,7 +837,7 @@
     }, 1400);
   }
 
-  function drawCursor(x, y, radius) {
+  function drawCursor(x, y, radius, isFast = false) {
     cursorCtx.clearRect(0, 0, cursorCanvas.width, cursorCanvas.height);
     if (activeTool === 'bgblur' || activeTool === 'adjust' || activeTool === 'text') return;
 
@@ -743,8 +845,10 @@
     const canvasR = radius * sf;
 
     cursorCtx.save();
-    cursorCtx.shadowColor = 'rgba(0, 0, 0, 0.9)';
-    cursorCtx.shadowBlur = 6 * sf;
+    if (!isFast) {
+      cursorCtx.shadowColor = 'rgba(0, 0, 0, 0.85)';
+      cursorCtx.shadowBlur = 4 * sf;
+    }
 
     // Outer boundary ring
     cursorCtx.beginPath();
@@ -756,12 +860,12 @@
     } else {
       cursorCtx.strokeStyle = 'rgba(255, 255, 255, 1.0)';
     }
-    cursorCtx.lineWidth = Math.max(3 * sf, 3);
+    cursorCtx.lineWidth = Math.max(2.5 * sf, 2);
     cursorCtx.stroke();
 
     // Center precision dot
     cursorCtx.beginPath();
-    cursorCtx.arc(x, y, Math.max(2.5 * sf, 2.5), 0, Math.PI * 2);
+    cursorCtx.arc(x, y, Math.max(2 * sf, 2), 0, Math.PI * 2);
     cursorCtx.fillStyle = cursorCtx.strokeStyle;
     cursorCtx.fill();
 
@@ -773,14 +877,23 @@
       cursorCtx.arc(x, y, innerRadius, 0, Math.PI * 2);
       cursorCtx.setLineDash([4 * sf, 4 * sf]);
       cursorCtx.strokeStyle = (activeTool === 'skinsmooth') ? 'rgba(251, 191, 36, 0.85)' : 'rgba(56, 189, 248, 0.85)';
-      cursorCtx.lineWidth = Math.max(2 * sf, 2);
+      cursorCtx.lineWidth = Math.max(1.8 * sf, 1.8);
       cursorCtx.stroke();
       cursorCtx.setLineDash([]);
     }
     cursorCtx.restore();
   }
 
-  // --- Tool 1: Tattoo Mask Drawing ---
+  // --- Tool 1: Tattoo Mask Drawing with Quadratic Bézier Splines ---
+  function drawEraseDot(x, y) {
+    const sf = getScaleFactor();
+    const radius = eraseBrushRadius * sf;
+    maskCtx.fillStyle = 'rgba(255, 46, 99, 0.85)';
+    maskCtx.beginPath();
+    maskCtx.arc(x, y, radius, 0, Math.PI * 2);
+    maskCtx.fill();
+  }
+
   function drawEraseStroke(x1, y1, x2, y2) {
     const sf = getScaleFactor();
     const radius = eraseBrushRadius * sf;
@@ -791,14 +904,24 @@
     maskCtx.lineJoin = 'round';
 
     maskCtx.beginPath();
-    if (Math.abs(x1 - x2) < 0.5 && Math.abs(y1 - y2) < 0.5) {
-      maskCtx.arc(x1, y1, radius, 0, Math.PI * 2);
-      maskCtx.fill();
-    } else {
-      maskCtx.moveTo(x1, y1);
-      maskCtx.lineTo(x2, y2);
-      maskCtx.stroke();
-    }
+    maskCtx.moveTo(x1, y1);
+    maskCtx.lineTo(x2, y2);
+    maskCtx.stroke();
+  }
+
+  function drawEraseCurve(x0, y0, cx, cy, x1, y1) {
+    const sf = getScaleFactor();
+    const radius = eraseBrushRadius * sf;
+    maskCtx.strokeStyle = 'rgba(255, 46, 99, 0.85)';
+    maskCtx.fillStyle = 'rgba(255, 46, 99, 0.85)';
+    maskCtx.lineWidth = radius * 2;
+    maskCtx.lineCap = 'round';
+    maskCtx.lineJoin = 'round';
+
+    maskCtx.beginPath();
+    maskCtx.moveTo(x0, y0);
+    maskCtx.quadraticCurveTo(cx, cy, x1, y1);
+    maskCtx.stroke();
   }
 
   brushSizeInput.addEventListener('input', (e) => {
