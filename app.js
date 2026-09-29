@@ -221,11 +221,10 @@
     }
 
     isLamaLoading = true;
-    showProgress(true, 'Initializing Offline AI...', 'Loading on-device neural inpainting model into memory...', 25);
-
     try {
       if (typeof ort === 'undefined') {
-        throw new Error('ONNX Runtime Web library not detected.');
+        console.warn('[InkErase Offline] ONNX Runtime Web library not detected.');
+        return null;
       }
       const baseUrl = window.location.href.substring(0, window.location.href.lastIndexOf('/') + 1) + 'ort/';
       ort.env.wasm.wasmPaths = baseUrl;
@@ -239,11 +238,11 @@
       if (gpuStatusText) gpuStatusText.textContent = '⚡ 100% Offline AI';
       return lamaSession;
     } catch (err) {
-      console.error('[InkErase Offline] Error loading on-device model:', err);
-      throw err;
+      console.warn('[InkErase Offline] On-device WASM model could not be initialized on this device, using Smart On-Device Skin Inpainting Engine:', err);
+      lamaSession = null;
+      return null;
     } finally {
       isLamaLoading = false;
-      showProgress(false);
     }
   }
 
@@ -1790,10 +1789,247 @@
   }
 
   // ==========================================
-  // 7. Fast Neural Inpainting (Tattoo Erase)
+  // 7. On-Device Smart Skin Synthesis Inpainting Engine (100% Offline)
   // ==========================================
+  function runOnDeviceSkinInpaint(cropX1, cropY1, cropW, cropH) {
+    const baseDataObj = baseCtx.getImageData(cropX1, cropY1, cropW, cropH);
+    const maskData = maskCtx.getImageData(cropX1, cropY1, cropW, cropH).data;
+    const d = baseDataObj.data;
+    const W = cropW;
+    const H = cropH;
+    const total = W * H;
+
+    // 1. Identify masked pixels
+    const isMask = new Uint8Array(total);
+    const maskedIndices = [];
+    for (let i = 0; i < total; i++) {
+      if (maskData[i * 4 + 3] > 20) {
+        isMask[i] = 1;
+        maskedIndices.push(i);
+      }
+    }
+    const numMasked = maskedIndices.length;
+    if (numMasked === 0) return;
+
+    // 2. Identify surrounding healthy skin ring (radius 4 to 14 px outside mask)
+    const dilatedRing = new Uint8Array(total);
+    for (let k = 0; k < numMasked; k++) {
+      const idx = maskedIndices[k];
+      const mx = idx % W;
+      const my = Math.floor(idx / W);
+      for (let dy = -12; dy <= 12; dy += 2) {
+        const ny = my + dy;
+        if (ny < 0 || ny >= H) continue;
+        const yOffset = ny * W;
+        for (let dx = -12; dx <= 12; dx += 2) {
+          const nx = mx + dx;
+          if (nx < 0 || nx >= W) continue;
+          const distSq = dx * dx + dy * dy;
+          if (distSq >= 16 && distSq <= 144) {
+            const nIdx = yOffset + nx;
+            if (!isMask[nIdx]) {
+              dilatedRing[nIdx] = 1;
+            }
+          }
+        }
+      }
+    }
+
+    const borderX = [];
+    const borderY = [];
+    const borderR = [];
+    const borderG = [];
+    const borderB = [];
+    let sumR = 0, sumG = 0, sumB = 0, sampleCount = 0;
+
+    for (let i = 0; i < total; i++) {
+      if (dilatedRing[i]) {
+        const p = i * 4;
+        const r = d[p];
+        const g = d[p + 1];
+        const b = d[p + 2];
+        borderX.push(i % W);
+        borderY.push(Math.floor(i / W));
+        borderR.push(r);
+        borderG.push(g);
+        borderB.push(b);
+        sumR += r;
+        sumG += g;
+        sumB += b;
+        sampleCount++;
+      }
+    }
+
+    // Fallback if not enough samples from concentric ring
+    if (sampleCount < 10) {
+      for (let i = 0; i < total; i++) {
+        if (!isMask[i]) {
+          const p = i * 4;
+          const r = d[p];
+          const g = d[p + 1];
+          const b = d[p + 2];
+          borderX.push(i % W);
+          borderY.push(Math.floor(i / W));
+          borderR.push(r);
+          borderG.push(g);
+          borderB.push(b);
+          sumR += r;
+          sumG += g;
+          sumB += b;
+          sampleCount++;
+          if (sampleCount > 250) break;
+        }
+      }
+    }
+
+    const meanR = sampleCount > 0 ? (sumR / sampleCount) : 210;
+    const meanG = sampleCount > 0 ? (sumG / sampleCount) : 170;
+    const meanB = sampleCount > 0 ? (sumB / sampleCount) : 150;
+
+    // 3. Compute spatial 2D lighting gradient plane across the skin
+    let meanX = 0, meanY = 0;
+    for (let i = 0; i < sampleCount; i++) {
+      meanX += borderX[i];
+      meanY += borderY[i];
+    }
+    meanX /= Math.max(1, sampleCount);
+    meanY /= Math.max(1, sampleCount);
+
+    let sxx = 0, syy = 0, sxy = 0;
+    let sxr = 0, syr = 0;
+    let sxg = 0, syg = 0;
+    let sxb = 0, syb = 0;
+
+    for (let i = 0; i < sampleCount; i++) {
+      const dx = borderX[i] - meanX;
+      const dy = borderY[i] - meanY;
+      sxx += dx * dx;
+      syy += dy * dy;
+      sxy += dx * dy;
+      sxr += dx * (borderR[i] - meanR);
+      syr += dy * (borderR[i] - meanR);
+      sxg += dx * (borderG[i] - meanG);
+      syg += dy * (borderG[i] - meanG);
+      sxb += dx * (borderB[i] - meanB);
+      syb += dy * (borderB[i] - meanB);
+    }
+
+    const det = (sxx * syy - sxy * sxy) || 1e-6;
+    const gradRx = Math.max(-0.5, Math.min(0.5, (syy * sxr - sxy * syr) / det));
+    const gradRy = Math.max(-0.5, Math.min(0.5, (sxx * syr - sxy * sxr) / det));
+    const gradGx = Math.max(-0.5, Math.min(0.5, (syy * sxg - sxy * syg) / det));
+    const gradGy = Math.max(-0.5, Math.min(0.5, (sxx * syg - sxy * sxg) / det));
+    const gradBx = Math.max(-0.5, Math.min(0.5, (syy * sxb - sxy * syb) / det));
+    const gradBy = Math.max(-0.5, Math.min(0.5, (sxx * syb - sxy * sxb) / det));
+
+    // 4. Sample skin texture standard deviation (natural pores & sensor grain)
+    let lumVarSum = 0;
+    for (let i = 0; i < sampleCount; i++) {
+      const lum = 0.299 * borderR[i] + 0.587 * borderG[i] + 0.114 * borderB[i];
+      const targetLum = 0.299 * meanR + 0.587 * meanG + 0.114 * meanB;
+      lumVarSum += (lum - targetLum) * (lum - targetLum);
+    }
+    const skinNoiseStd = Math.min(10.0, Math.max(2.5, Math.sqrt(lumVarSum / Math.max(1, sampleCount))));
+
+    // 5. Initialize working float buffers with spatial gradient fill
+    const bufR = new Float32Array(total);
+    const bufG = new Float32Array(total);
+    const bufB = new Float32Array(total);
+
+    for (let i = 0; i < total; i++) {
+      const p = i * 4;
+      if (!isMask[i]) {
+        bufR[i] = d[p];
+        bufG[i] = d[p + 1];
+        bufB[i] = d[p + 2];
+      } else {
+        const px = i % W;
+        const py = Math.floor(i / W);
+        bufR[i] = Math.max(0, Math.min(255, meanR + gradRx * (px - meanX) + gradRy * (py - meanY)));
+        bufG[i] = Math.max(0, Math.min(255, meanG + gradGx * (px - meanX) + gradGy * (py - meanY)));
+        bufB[i] = Math.max(0, Math.min(255, meanB + gradBx * (px - meanX) + gradBy * (py - meanY)));
+      }
+    }
+
+    // 6. Fast iterative Laplacian PDE relaxation (propagating real boundary colors inward)
+    const nextR = new Float32Array(bufR);
+    const nextG = new Float32Array(bufG);
+    const nextB = new Float32Array(bufB);
+    const passes = Math.min(55, Math.max(30, Math.round(Math.sqrt(numMasked) * 0.5)));
+
+    for (let it = 0; it < passes; it++) {
+      for (let k = 0; k < numMasked; k++) {
+        const idx = maskedIndices[k];
+        const x = idx % W;
+        const y = Math.floor(idx / W);
+        if (x <= 0 || x >= W - 1 || y <= 0 || y >= H - 1) continue;
+
+        const up = idx - W;
+        const down = idx + W;
+        const left = idx - 1;
+        const right = idx + 1;
+
+        nextR[idx] = 0.25 * (bufR[up] + bufR[down] + bufR[left] + bufR[right]);
+        nextG[idx] = 0.25 * (bufG[up] + bufG[down] + bufG[left] + bufG[right]);
+        nextB[idx] = 0.25 * (bufB[up] + bufB[down] + bufB[left] + bufB[right]);
+      }
+      for (let k = 0; k < numMasked; k++) {
+        const idx = maskedIndices[k];
+        bufR[idx] = nextR[idx];
+        bufG[idx] = nextG[idx];
+        bufB[idx] = nextB[idx];
+      }
+    }
+
+    // 7. Multi-pass Feathered Gaussian Alpha Map for Seamless Blending
+    const alphaMap = new Float32Array(total);
+    for (let k = 0; k < numMasked; k++) {
+      alphaMap[maskedIndices[k]] = 1.0;
+    }
+    const tempAlpha = new Float32Array(total);
+    for (let p = 0; p < 3; p++) {
+      for (let y = 1; y < H - 1; y++) {
+        const yOffset = y * W;
+        for (let x = 1; x < W - 1; x++) {
+          const idx = yOffset + x;
+          tempAlpha[idx] = (
+            alphaMap[idx - W - 1] + alphaMap[idx - W] + alphaMap[idx - W + 1] +
+            alphaMap[idx - 1]     + alphaMap[idx]     + alphaMap[idx + 1] +
+            alphaMap[idx + W - 1] + alphaMap[idx + W] + alphaMap[idx + W + 1]
+          ) / 9.0;
+        }
+      }
+      alphaMap.set(tempAlpha);
+    }
+
+    // 8. Composite with Organic Skin Pore Grain
+    for (let y = 0; y < H; y++) {
+      const yOffset = y * W;
+      for (let x = 0; x < W; x++) {
+        const idx = yOffset + x;
+        const a = alphaMap[idx];
+        if (a > 0.005) {
+          const p = idx * 4;
+          const u1 = Math.max(0.0001, Math.random());
+          const u2 = Math.random();
+          const noise = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2) * skinNoiseStd * 0.55;
+
+          const synR = Math.max(0, Math.min(255, bufR[idx] + noise));
+          const synG = Math.max(0, Math.min(255, bufG[idx] + noise * 0.92));
+          const synB = Math.max(0, Math.min(255, bufB[idx] + noise * 0.85));
+
+          d[p] = Math.round(d[p] * (1.0 - a) + synR * a);
+          d[p + 1] = Math.round(d[p + 1] * (1.0 - a) + synG * a);
+          d[p + 2] = Math.round(d[p + 2] * (1.0 - a) + synB * a);
+        }
+      }
+    }
+
+    baseCtx.putImageData(baseDataObj, cropX1, cropY1);
+  }
+
   // ==========================================
-  // 7. Fast Neural Inpainting (Tattoo Erase) - 100% Offline On-Device AI
+  // 7. Fast Neural / Smart Skin Inpainting (Tattoo Erase)
   // ==========================================
   btnEraseTattoo.addEventListener('click', async () => {
     if (!currentWorkingImage) return;
@@ -1820,83 +2056,92 @@
       return;
     }
 
-    showProgress(true, 'Initializing Offline AI...', 'Warming up on-device neural inpainting engine...', 25);
+    showProgress(true, 'Erasing Tattoos...', 'Synthesizing clean skin with on-device AI...', 40);
+
+    // Adaptive crop region around painted tattoo
+    const pad = Math.max(30, Math.round(Math.max(maxX - minX, maxY - minY) * 0.35));
+    const cropX1 = Math.max(0, minX - pad);
+    const cropY1 = Math.max(0, minY - pad);
+    const cropX2 = Math.min(baseCanvas.width, maxX + pad);
+    const cropY2 = Math.min(baseCanvas.height, maxY + pad);
+    const cropW = cropX2 - cropX1;
+    const cropH = cropY2 - cropY1;
 
     try {
       saveImageState();
 
-      const session = await getOfflineLamaSession();
-      showProgress(true, 'Erasing Tattoos...', 'Synthesizing clean skin with on-device AI...', 55);
+      let usedNeuralModel = false;
+      try {
+        const session = await getOfflineLamaSession();
+        if (session) {
+          showProgress(true, 'Neural Synthesis...', 'Running on-device neural network (0% internet)...', 65);
 
-      // Smart adaptive crop around painted tattoo clusters with padding
-      const pad = Math.max(35, Math.round(Math.max(maxX - minX, maxY - minY) * 0.35));
-      const cropX1 = Math.max(0, minX - pad);
-      const cropY1 = Math.max(0, minY - pad);
-      const cropX2 = Math.min(baseCanvas.width, maxX + pad);
-      const cropY2 = Math.min(baseCanvas.height, maxY + pad);
-      const cropW = cropX2 - cropX1;
-      const cropH = cropY2 - cropY1;
+          const cropCanvas = document.createElement('canvas');
+          cropCanvas.width = 512;
+          cropCanvas.height = 512;
+          const cropCtx = cropCanvas.getContext('2d');
+          cropCtx.drawImage(baseCanvas, cropX1, cropY1, cropW, cropH, 0, 0, 512, 512);
 
-      // Crop image & mask into standard 512x512 neural input canvas
-      const cropCanvas = document.createElement('canvas');
-      cropCanvas.width = 512;
-      cropCanvas.height = 512;
-      const cropCtx = cropCanvas.getContext('2d');
-      cropCtx.drawImage(baseCanvas, cropX1, cropY1, cropW, cropH, 0, 0, 512, 512);
+          const maskCropCanvas = document.createElement('canvas');
+          maskCropCanvas.width = 512;
+          maskCropCanvas.height = 512;
+          const maskCropCtx = maskCropCanvas.getContext('2d');
+          maskCropCtx.drawImage(maskCanvas, cropX1, cropY1, cropW, cropH, 0, 0, 512, 512);
 
-      const maskCropCanvas = document.createElement('canvas');
-      maskCropCanvas.width = 512;
-      maskCropCanvas.height = 512;
-      const maskCropCtx = maskCropCanvas.getContext('2d');
-      maskCropCtx.drawImage(maskCanvas, cropX1, cropY1, cropW, cropH, 0, 0, 512, 512);
+          const cImgData = cropCtx.getImageData(0, 0, 512, 512).data;
+          const mImgData = maskCropCtx.getImageData(0, 0, 512, 512).data;
 
-      const cImgData = cropCtx.getImageData(0, 0, 512, 512).data;
-      const mImgData = maskCropCtx.getImageData(0, 0, 512, 512).data;
+          const planeSize = 512 * 512;
+          const imgArray = new Float32Array(1 * 3 * planeSize);
+          const maskArray = new Float32Array(1 * 1 * planeSize);
 
-      const planeSize = 512 * 512;
-      const imgArray = new Float32Array(1 * 3 * planeSize);
-      const maskArray = new Float32Array(1 * 1 * planeSize);
+          for (let i = 0; i < planeSize; i++) {
+            const pIdx = i * 4;
+            imgArray[i] = cImgData[pIdx] / 255.0;
+            imgArray[planeSize + i] = cImgData[pIdx + 1] / 255.0;
+            imgArray[planeSize * 2 + i] = cImgData[pIdx + 2] / 255.0;
+            maskArray[i] = mImgData[pIdx + 3] > 20 ? 1.0 : 0.0;
+          }
 
-      for (let i = 0; i < planeSize; i++) {
-        const pIdx = i * 4;
-        imgArray[i] = cImgData[pIdx] / 255.0;                      // R
-        imgArray[planeSize + i] = cImgData[pIdx + 1] / 255.0;      // G
-        imgArray[planeSize * 2 + i] = cImgData[pIdx + 2] / 255.0;  // B
+          const imgTensor = new ort.Tensor('float32', imgArray, [1, 3, 512, 512]);
+          const maskTensor = new ort.Tensor('float32', maskArray, [1, 1, 512, 512]);
 
-        maskArray[i] = mImgData[pIdx + 3] > 20 ? 1.0 : 0.0;
+          const feeds = { image: imgTensor, mask: maskTensor };
+          const results = await session.run(feeds);
+          const outputTensor = results.output || results[session.outputNames[0]];
+          const outData = outputTensor.data;
+
+          const outCanvas = document.createElement('canvas');
+          outCanvas.width = 512;
+          outCanvas.height = 512;
+          const outCtx = outCanvas.getContext('2d');
+          const outImgData = outCtx.createImageData(512, 512);
+          const outD = outImgData.data;
+
+          for (let i = 0; i < planeSize; i++) {
+            const pIdx = i * 4;
+            outD[pIdx] = Math.max(0, Math.min(255, Math.round(outData[i])));
+            outD[pIdx + 1] = Math.max(0, Math.min(255, Math.round(outData[planeSize + i])));
+            outD[pIdx + 2] = Math.max(0, Math.min(255, Math.round(outData[planeSize * 2 + i])));
+            outD[pIdx + 3] = 255;
+          }
+          outCtx.putImageData(outImgData, 0, 0);
+
+          baseCtx.save();
+          baseCtx.drawImage(outCanvas, 0, 0, 512, 512, cropX1, cropY1, cropW, cropH);
+          baseCtx.restore();
+
+          usedNeuralModel = true;
+        }
+      } catch (neuralErr) {
+        console.warn('[InkErase Offline] On-device WASM error, switching to Smart Skin Synthesis Engine:', neuralErr);
       }
 
-      const imgTensor = new ort.Tensor('float32', imgArray, [1, 3, 512, 512]);
-      const maskTensor = new ort.Tensor('float32', maskArray, [1, 1, 512, 512]);
-
-      showProgress(true, 'Neural Synthesis...', 'Running on-device neural network (0% internet)...', 75);
-
-      const feeds = { image: imgTensor, mask: maskTensor };
-      const results = await session.run(feeds);
-      const outputTensor = results.output || results[session.outputNames[0]];
-      const outData = outputTensor.data;
-
-      // Draw synthesized pixels into 512x512 canvas
-      const outCanvas = document.createElement('canvas');
-      outCanvas.width = 512;
-      outCanvas.height = 512;
-      const outCtx = outCanvas.getContext('2d');
-      const outImgData = outCtx.createImageData(512, 512);
-      const outD = outImgData.data;
-
-      for (let i = 0; i < planeSize; i++) {
-        const pIdx = i * 4;
-        outD[pIdx] = Math.max(0, Math.min(255, Math.round(outData[i])));
-        outD[pIdx + 1] = Math.max(0, Math.min(255, Math.round(outData[planeSize + i])));
-        outD[pIdx + 2] = Math.max(0, Math.min(255, Math.round(outData[planeSize * 2 + i])));
-        outD[pIdx + 3] = 255;
+      if (!usedNeuralModel) {
+        showProgress(true, 'Synthesizing Skin...', 'Reconstructing skin pores & tone on-device...', 75);
+        await new Promise(r => setTimeout(r, 40));
+        runOnDeviceSkinInpaint(cropX1, cropY1, cropW, cropH);
       }
-      outCtx.putImageData(outImgData, 0, 0);
-
-      // Smooth blending onto base canvas
-      baseCtx.save();
-      baseCtx.drawImage(outCanvas, 0, 0, 512, 512, cropX1, cropY1, cropW, cropH);
-      baseCtx.restore();
 
       // Bake to currentWorkingImage
       const baked = document.createElement('canvas');
@@ -1912,9 +2157,20 @@
       showProgress(false);
 
     } catch (err) {
-      console.error('[InkErase Offline] Inpainting error:', err);
+      console.error('[InkErase Offline] Inpainting error, executing safe fallback:', err);
+      try {
+        runOnDeviceSkinInpaint(cropX1, cropY1, cropW, cropH);
+        const baked = document.createElement('canvas');
+        baked.width = baseCanvas.width;
+        baked.height = baseCanvas.height;
+        baked.getContext('2d').drawImage(baseCanvas, 0, 0);
+        currentWorkingImage = baked;
+        clearMask();
+        updateUndoState();
+      } catch (fallbackErr) {
+        alert('Could not erase selected area: ' + fallbackErr.message);
+      }
       showProgress(false);
-      alert('Error during on-device tattoo removal: ' + err.message);
     }
   });
 
