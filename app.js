@@ -130,6 +130,39 @@
   const btnCancelText = document.getElementById('btnCancelText');
   const btnCancelTextBottom = document.getElementById('btnCancelTextBottom');
 
+  // Text Studio Effect Controls
+  const panelOutlineSettings = document.getElementById('panelOutlineSettings');
+  const activeOutlineTag = document.getElementById('activeOutlineTag');
+  const outlineColorPicker = document.getElementById('outlineColorPicker');
+  const outlineWidthSlider = document.getElementById('outlineWidthSlider');
+  const outlineWidthVal = document.getElementById('outlineWidthVal');
+  const outlineOpacitySlider = document.getElementById('outlineOpacitySlider');
+  const outlineOpacityVal = document.getElementById('outlineOpacityVal');
+
+  const panelShadowSettings = document.getElementById('panelShadowSettings');
+  const activeShadowTag = document.getElementById('activeShadowTag');
+  const shadowColorPicker = document.getElementById('shadowColorPicker');
+  const shadowBlurSlider = document.getElementById('shadowBlurSlider');
+  const shadowBlurVal = document.getElementById('shadowBlurVal');
+  const shadowDistSlider = document.getElementById('shadowDistSlider');
+  const shadowDistVal = document.getElementById('shadowDistVal');
+  const shadowOpacitySlider = document.getElementById('shadowOpacitySlider');
+  const shadowOpacityVal = document.getElementById('shadowOpacityVal');
+
+  const panelGlowSettings = document.getElementById('panelGlowSettings');
+  const activeGlowTag = document.getElementById('activeGlowTag');
+  const glowColorPicker = document.getElementById('glowColorPicker');
+  const glowRadiusSlider = document.getElementById('glowRadiusSlider');
+  const glowRadiusVal = document.getElementById('glowRadiusVal');
+  const glowOpacitySlider = document.getElementById('glowOpacitySlider');
+  const glowOpacityVal = document.getElementById('glowOpacityVal');
+
+  const panelBoxSettings = document.getElementById('panelBoxSettings');
+  const activeBoxTag = document.getElementById('activeBoxTag');
+  const boxColorPicker = document.getElementById('boxColorPicker');
+  const boxOpacitySlider = document.getElementById('boxOpacitySlider');
+  const boxOpacityVal = document.getElementById('boxOpacityVal');
+
   // Canvas Contexts
   const baseCtx = baseCanvas.getContext('2d', { willReadFrequently: true });
   const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
@@ -185,6 +218,38 @@
   let dragStartPointerY = 0;
   let dragStartTextX = 0;
   let dragStartTextY = 0;
+
+  // Individual Effect Parameters (Isolated from Text Fill)
+  let outlineColor = '#000000';
+  let outlineWidth = 4;
+  let outlineOpacity = 1.0;
+
+  let shadowColor = '#000000';
+  let shadowBlur = 12;
+  let shadowDist = 4;
+  let shadowOpacity = 0.9;
+
+  let glowColor = '#38bdf8';
+  let glowRadius = 18;
+  let glowOpacity = 1.0;
+
+  let boxColor = '#000000';
+  let boxOpacity = 0.72;
+
+  function hexToRgba(hex, alpha) {
+    if (!hex) return `rgba(255, 255, 255, ${alpha !== undefined ? alpha : 1})`;
+    let c = hex.replace('#', '').trim();
+    if (c.length === 3) {
+      c = c.split('').map(x => x + x).join('');
+    }
+    const num = parseInt(c, 16);
+    if (isNaN(num)) return `rgba(255, 255, 255, ${alpha !== undefined ? alpha : 1})`;
+    const r = (num >> 16) & 255;
+    const g = (num >> 8) & 255;
+    const b = num & 255;
+    const a = typeof alpha === 'number' ? Math.max(0, Math.min(1, alpha)) : 1;
+    return `rgba(${r}, ${g}, ${b}, ${a})`;
+  }
 
   // Zoom & Pan State
   let scale = 1.0;
@@ -1072,30 +1137,187 @@
     renderLiveBokeh();
   }
 
+  let selfieSegmenter = null;
+
+  async function getOfflineSegmenter() {
+    if (selfieSegmenter) return selfieSegmenter;
+    if (typeof window.SelfieSegmentation === 'undefined') return null;
+
+    try {
+      const segmenter = new window.SelfieSegmentation({
+        locateFile: (file) => {
+          return 'mediapipe/' + file;
+        }
+      });
+      await segmenter.setOptions({
+        modelSelection: 1 // 1: Landscape model (more accurate for portraits and full body)
+      });
+      selfieSegmenter = segmenter;
+      return selfieSegmenter;
+    } catch (err) {
+      console.warn('Could not initialize MediaPipe SelfieSegmentation:', err);
+      return null;
+    }
+  }
+
+  function generateSaliencySubjectMask(sourceCanvas, targetCanvas) {
+    const sw = sourceCanvas.width;
+    const sh = sourceCanvas.height;
+    const targetCtx = targetCanvas.getContext('2d');
+
+    const dw = 180;
+    const dh = Math.max(60, Math.round(180 * (sh / sw)));
+    const smallC = document.createElement('canvas');
+    smallC.width = dw;
+    smallC.height = dh;
+    const sCtx = smallC.getContext('2d');
+    sCtx.drawImage(sourceCanvas, 0, 0, dw, dh);
+
+    const imgData = sCtx.getImageData(0, 0, dw, dh);
+    const data = imgData.data;
+
+    let bgR = 0, bgG = 0, bgB = 0, bgCount = 0;
+    const marginX = Math.max(2, Math.floor(dw * 0.08));
+    const marginY = Math.max(2, Math.floor(dh * 0.08));
+
+    for (let y = 0; y < dh; y++) {
+      for (let x = 0; x < dw; x++) {
+        const isBorder = (x < marginX || x >= dw - marginX || y < marginY || y >= dh - marginY);
+        if (isBorder) {
+          const idx = (y * dw + x) * 4;
+          bgR += data[idx];
+          bgG += data[idx + 1];
+          bgB += data[idx + 2];
+          bgCount++;
+        }
+      }
+    }
+    bgR = bgR / Math.max(1, bgCount);
+    bgG = bgG / Math.max(1, bgCount);
+    bgB = bgB / Math.max(1, bgCount);
+
+    const maskBuffer = new Uint8ClampedArray(dw * dh);
+    const cx = dw * 0.5;
+    const cy = dh * 0.5;
+    const maxRadius = Math.sqrt(cx * cx + cy * cy);
+
+    for (let y = 0; y < dh; y++) {
+      for (let x = 0; x < dw; x++) {
+        const idx = (y * dw + x) * 4;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+
+        const dr = r - bgR;
+        const dg = g - bgG;
+        const db = b - bgB;
+        const colorDist = Math.sqrt(dr * dr + dg * dg + db * db) / 441.67;
+
+        let edge = 0;
+        if (x < dw - 1 && y < dh - 1) {
+          const rightIdx = idx + 4;
+          const downIdx = idx + dw * 4;
+          const gradX = Math.abs(r - data[rightIdx]) + Math.abs(g - data[rightIdx + 1]) + Math.abs(b - data[rightIdx + 2]);
+          const gradY = Math.abs(r - data[downIdx]) + Math.abs(g - data[downIdx + 1]) + Math.abs(b - data[downIdx + 2]);
+          edge = (gradX + gradY) / (3 * 255);
+        }
+
+        const distFromCenter = Math.sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy)) / maxRadius;
+        const centerWeight = Math.max(0.1, 1.0 - Math.pow(distFromCenter * 1.3, 2));
+
+        let score = (colorDist * 1.5 + edge * 0.9) * centerWeight;
+        score = 1.0 / (1.0 + Math.exp(-9.0 * (score - 0.26)));
+        maskBuffer[y * dw + x] = Math.round(Math.min(255, Math.max(0, score * 255)));
+      }
+    }
+
+    const maskImgData = sCtx.createImageData(dw, dh);
+    for (let i = 0; i < dw * dh; i++) {
+      const pIdx = i * 4;
+      const v = maskBuffer[i];
+      maskImgData.data[pIdx] = 255;
+      maskImgData.data[pIdx + 1] = 255;
+      maskImgData.data[pIdx + 2] = 255;
+      maskImgData.data[pIdx + 3] = v;
+    }
+    sCtx.putImageData(maskImgData, 0, 0);
+
+    targetCtx.clearRect(0, 0, sw, sh);
+    targetCtx.imageSmoothingEnabled = true;
+    targetCtx.imageSmoothingQuality = 'high';
+    targetCtx.drawImage(smallC, 0, 0, sw, sh);
+  }
+
   async function extractSubjectMask() {
     if (isExtractingMask || !currentWorkingImage) return;
     isExtractingMask = true;
-    showProgress(true, 'Detecting Subject...', 'Generating on-device depth mask...', 50);
+    showProgress(true, 'Detecting Subject...', 'Generating AI subject silhouette...', 40);
 
     try {
       const w = baseCanvas.width;
       const h = baseCanvas.height;
+      let maskBitmapOrCanvas = null;
+
+      // 1. Try on-device MediaPipe Selfie Neural Network
+      try {
+        const segmenter = await getOfflineSegmenter();
+        if (segmenter) {
+          const maxDim = 1024;
+          let sendCanvas = baseCanvas;
+          if (Math.max(w, h) > maxDim) {
+            const scaleDown = maxDim / Math.max(w, h);
+            sendCanvas = document.createElement('canvas');
+            sendCanvas.width = Math.round(w * scaleDown);
+            sendCanvas.height = Math.round(h * scaleDown);
+            sendCanvas.getContext('2d').drawImage(baseCanvas, 0, 0, sendCanvas.width, sendCanvas.height);
+          }
+
+          maskBitmapOrCanvas = await new Promise((resolve) => {
+            let resolved = false;
+            const timeout = setTimeout(() => {
+              if (!resolved) {
+                resolved = true;
+                console.warn('MediaPipe segmentation timeout, using saliency.');
+                resolve(null);
+              }
+            }, 5000);
+
+            segmenter.onResults((results) => {
+              if (resolved) return;
+              resolved = true;
+              clearTimeout(timeout);
+              if (results && results.segmentationMask) {
+                resolve(results.segmentationMask);
+              } else {
+                resolve(null);
+              }
+            });
+
+            segmenter.send({ image: sendCanvas }).catch(err => {
+              if (!resolved) {
+                resolved = true;
+                clearTimeout(timeout);
+                console.warn('segmenter.send error:', err);
+                resolve(null);
+              }
+            });
+          });
+        }
+      } catch (segErr) {
+        console.warn('MediaPipe segmenter error:', segErr);
+        maskBitmapOrCanvas = null;
+      }
+
       const maskC = document.createElement('canvas');
       maskC.width = w;
       maskC.height = h;
       const mCtx = maskC.getContext('2d');
 
-      const cx = w * 0.5;
-      const cy = h * 0.48;
-      const rx = w * 0.38;
-      const ry = h * 0.46;
-
-      const grad = mCtx.createRadialGradient(cx, cy, Math.min(rx, ry) * 0.4, cx, cy, Math.max(rx, ry));
-      grad.addColorStop(0, 'rgba(255, 255, 255, 1.0)');
-      grad.addColorStop(0.7, 'rgba(255, 255, 255, 0.9)');
-      grad.addColorStop(1, 'rgba(255, 255, 255, 0.0)');
-      mCtx.fillStyle = grad;
-      mCtx.fillRect(0, 0, w, h);
+      if (maskBitmapOrCanvas) {
+        mCtx.drawImage(maskBitmapOrCanvas, 0, 0, w, h);
+      } else {
+        generateSaliencySubjectMask(baseCanvas, maskC);
+      }
 
       const cutoutC = document.createElement('canvas');
       cutoutC.width = w;
@@ -1113,7 +1335,7 @@
       cachedSubjectCutout = cutoutImg;
       showProgress(false);
     } catch (e) {
-      console.warn('Offline subject mask fallback:', e);
+      console.warn('Offline subject mask fallback error:', e);
       showProgress(false);
     } finally {
       isExtractingMask = false;
@@ -1501,10 +1723,42 @@
     textBoxElement.style.fontStyle = textItalic ? 'italic' : 'normal';
     textContentDisplay.style.textDecoration = textUnderline ? 'underline' : 'none';
     textBoxElement.style.textAlign = textAlign;
-    textBoxElement.style.color = textColor;
-    textBoxElement.style.opacity = textOpacity;
 
-    // Effect Classes
+    // Independent Text Fill Color & Fill Opacity (Does NOT affect outline, shadow, glow, or box)
+    textContentDisplay.style.color = hexToRgba(textColor, textOpacity);
+    textBoxElement.style.opacity = '1';
+
+    // Toggle Effect Detail Subpanels
+    if (panelOutlineSettings) panelOutlineSettings.classList.toggle('hidden', textEffect !== 'border');
+    if (panelShadowSettings) panelShadowSettings.classList.toggle('hidden', textEffect !== 'shadow');
+    if (panelGlowSettings) panelGlowSettings.classList.toggle('hidden', textEffect !== 'glow');
+    if (panelBoxSettings) panelBoxSettings.classList.toggle('hidden', textEffect !== 'box');
+
+    // Reset base styles
+    textContentDisplay.style.webkitTextStroke = '0px transparent';
+    textContentDisplay.style.textShadow = 'none';
+    textBoxElement.style.backgroundColor = 'transparent';
+    textBoxElement.style.padding = '4px 8px';
+    textBoxElement.style.borderRadius = '0px';
+
+    // Apply specific effect styles independently
+    if (textEffect === 'border') {
+      const strokeRgba = hexToRgba(outlineColor, outlineOpacity);
+      textContentDisplay.style.webkitTextStroke = `${outlineWidth}px ${strokeRgba}`;
+    } else if (textEffect === 'shadow') {
+      const shadowRgba = hexToRgba(shadowColor, shadowOpacity);
+      textContentDisplay.style.textShadow = `0px ${shadowDist}px ${shadowBlur}px ${shadowRgba}`;
+    } else if (textEffect === 'glow') {
+      const glowRgba = hexToRgba(glowColor, glowOpacity);
+      textContentDisplay.style.textShadow = `0px 0px ${glowRadius}px ${glowRgba}, 0px 0px ${Math.round(glowRadius * 1.5)}px ${glowRgba}`;
+    } else if (textEffect === 'box') {
+      const boxRgba = hexToRgba(boxColor, boxOpacity);
+      textBoxElement.style.backgroundColor = boxRgba;
+      textBoxElement.style.padding = '10px 18px';
+      textBoxElement.style.borderRadius = '12px';
+    }
+
+    // Effect Classes for any auxiliary CSS
     textBoxElement.classList.toggle('effect-border', textEffect === 'border');
     textBoxElement.classList.toggle('effect-shadow', textEffect === 'shadow');
     textBoxElement.classList.toggle('effect-glow', textEffect === 'glow');
@@ -1534,10 +1788,12 @@
     const dx = (pt.clientX - dragStartPointerX) / scale;
     const dy = (pt.clientY - dragStartPointerY) / scale;
 
+    // Allow dragging freely without artificial squishing or premature wrapping
+    const boundMargin = 300;
     const clampW = displayWidth || 400;
     const clampH = displayHeight || 400;
-    textDisplayX = Math.max(10, Math.min(clampW - 10, dragStartTextX + dx));
-    textDisplayY = Math.max(10, Math.min(clampH - 10, dragStartTextY + dy));
+    textDisplayX = Math.max(-boundMargin, Math.min(clampW + boundMargin, dragStartTextX + dx));
+    textDisplayY = Math.max(-boundMargin, Math.min(clampH + boundMargin, dragStartTextY + dy));
 
     textBoxElement.style.left = `${textDisplayX}px`;
     textBoxElement.style.top = `${textDisplayY}px`;
@@ -1589,7 +1845,7 @@
     });
   }
 
-  // Font Selection Carousel Chips
+  // Font Selection Carousel Chips (Offline Google Fonts)
   if (fontChipsScroll) {
     fontChipsScroll.querySelectorAll('.font-chip').forEach(chip => {
       chip.addEventListener('click', () => {
@@ -1650,8 +1906,8 @@
     });
   });
 
-  // Color Swatches & Native Color Picker
-  const colorSwatches = panelText ? panelText.querySelectorAll('.color-swatch') : [];
+  // Main Text Color Swatches & Native Color Picker
+  const colorSwatches = panelText ? panelText.querySelectorAll('.color-swatch:not(.outline-color-swatch):not(.shadow-color-swatch):not(.glow-color-swatch):not(.box-color-swatch)') : [];
   colorSwatches.forEach(swatch => {
     swatch.addEventListener('click', () => {
       colorSwatches.forEach(s => s.classList.remove('active'));
@@ -1672,7 +1928,7 @@
     });
   }
 
-  // Size & Opacity Sliders
+  // Size & Fill Opacity Sliders
   if (textSizeSlider) {
     textSizeSlider.addEventListener('input', (e) => {
       textSize = parseInt(e.target.value, 10);
@@ -1686,6 +1942,146 @@
       const val = parseInt(e.target.value, 10);
       textOpacity = val / 100;
       if (textOpacityVal) textOpacityVal.textContent = `${val}%`;
+      updateTextPreview();
+    });
+  }
+
+  // Outline (Stroke) Controls
+  if (outlineWidthSlider) {
+    outlineWidthSlider.addEventListener('input', (e) => {
+      outlineWidth = parseInt(e.target.value, 10);
+      if (outlineWidthVal) outlineWidthVal.textContent = `${outlineWidth}px`;
+      updateTextPreview();
+    });
+  }
+  if (outlineOpacitySlider) {
+    outlineOpacitySlider.addEventListener('input', (e) => {
+      outlineOpacity = parseInt(e.target.value, 10) / 100;
+      if (outlineOpacityVal) outlineOpacityVal.textContent = `${e.target.value}%`;
+      updateTextPreview();
+    });
+  }
+  const outlineSwatches = panelText ? panelText.querySelectorAll('.outline-color-swatch') : [];
+  outlineSwatches.forEach(swatch => {
+    swatch.addEventListener('click', () => {
+      outlineSwatches.forEach(s => s.classList.remove('active'));
+      swatch.classList.add('active');
+      outlineColor = swatch.dataset.color;
+      if (activeOutlineTag) activeOutlineTag.textContent = outlineColor.toUpperCase();
+      if (outlineColorPicker) outlineColorPicker.value = outlineColor;
+      updateTextPreview();
+    });
+  });
+  if (outlineColorPicker) {
+    outlineColorPicker.addEventListener('input', (e) => {
+      outlineColor = e.target.value;
+      outlineSwatches.forEach(s => s.classList.remove('active'));
+      if (activeOutlineTag) activeOutlineTag.textContent = outlineColor.toUpperCase();
+      updateTextPreview();
+    });
+  }
+
+  // Shadow Controls
+  if (shadowBlurSlider) {
+    shadowBlurSlider.addEventListener('input', (e) => {
+      shadowBlur = parseInt(e.target.value, 10);
+      if (shadowBlurVal) shadowBlurVal.textContent = `${shadowBlur}px`;
+      updateTextPreview();
+    });
+  }
+  if (shadowDistSlider) {
+    shadowDistSlider.addEventListener('input', (e) => {
+      shadowDist = parseInt(e.target.value, 10);
+      if (shadowDistVal) shadowDistVal.textContent = `${shadowDist}px`;
+      updateTextPreview();
+    });
+  }
+  if (shadowOpacitySlider) {
+    shadowOpacitySlider.addEventListener('input', (e) => {
+      shadowOpacity = parseInt(e.target.value, 10) / 100;
+      if (shadowOpacityVal) shadowOpacityVal.textContent = `${e.target.value}%`;
+      updateTextPreview();
+    });
+  }
+  const shadowSwatches = panelText ? panelText.querySelectorAll('.shadow-color-swatch') : [];
+  shadowSwatches.forEach(swatch => {
+    swatch.addEventListener('click', () => {
+      shadowSwatches.forEach(s => s.classList.remove('active'));
+      swatch.classList.add('active');
+      shadowColor = swatch.dataset.color;
+      if (activeShadowTag) activeShadowTag.textContent = shadowColor.toUpperCase();
+      if (shadowColorPicker) shadowColorPicker.value = shadowColor;
+      updateTextPreview();
+    });
+  });
+  if (shadowColorPicker) {
+    shadowColorPicker.addEventListener('input', (e) => {
+      shadowColor = e.target.value;
+      shadowSwatches.forEach(s => s.classList.remove('active'));
+      if (activeShadowTag) activeShadowTag.textContent = shadowColor.toUpperCase();
+      updateTextPreview();
+    });
+  }
+
+  // Glow Controls
+  if (glowRadiusSlider) {
+    glowRadiusSlider.addEventListener('input', (e) => {
+      glowRadius = parseInt(e.target.value, 10);
+      if (glowRadiusVal) glowRadiusVal.textContent = `${glowRadius}px`;
+      updateTextPreview();
+    });
+  }
+  if (glowOpacitySlider) {
+    glowOpacitySlider.addEventListener('input', (e) => {
+      glowOpacity = parseInt(e.target.value, 10) / 100;
+      if (glowOpacityVal) glowOpacityVal.textContent = `${e.target.value}%`;
+      updateTextPreview();
+    });
+  }
+  const glowSwatches = panelText ? panelText.querySelectorAll('.glow-color-swatch') : [];
+  glowSwatches.forEach(swatch => {
+    swatch.addEventListener('click', () => {
+      glowSwatches.forEach(s => s.classList.remove('active'));
+      swatch.classList.add('active');
+      glowColor = swatch.dataset.color;
+      if (activeGlowTag) activeGlowTag.textContent = glowColor.toUpperCase();
+      if (glowColorPicker) glowColorPicker.value = glowColor;
+      updateTextPreview();
+    });
+  });
+  if (glowColorPicker) {
+    glowColorPicker.addEventListener('input', (e) => {
+      glowColor = e.target.value;
+      glowSwatches.forEach(s => s.classList.remove('active'));
+      if (activeGlowTag) activeGlowTag.textContent = glowColor.toUpperCase();
+      updateTextPreview();
+    });
+  }
+
+  // Box Controls
+  if (boxOpacitySlider) {
+    boxOpacitySlider.addEventListener('input', (e) => {
+      boxOpacity = parseInt(e.target.value, 10) / 100;
+      if (boxOpacityVal) boxOpacityVal.textContent = `${e.target.value}%`;
+      updateTextPreview();
+    });
+  }
+  const boxSwatches = panelText ? panelText.querySelectorAll('.box-color-swatch') : [];
+  boxSwatches.forEach(swatch => {
+    swatch.addEventListener('click', () => {
+      boxSwatches.forEach(s => s.classList.remove('active'));
+      swatch.classList.add('active');
+      boxColor = swatch.dataset.color;
+      if (activeBoxTag) activeBoxTag.textContent = boxColor.toUpperCase();
+      if (boxColorPicker) boxColorPicker.value = boxColor;
+      updateTextPreview();
+    });
+  });
+  if (boxColorPicker) {
+    boxColorPicker.addEventListener('input', (e) => {
+      boxColor = e.target.value;
+      boxSwatches.forEach(s => s.classList.remove('active'));
+      if (activeBoxTag) activeBoxTag.textContent = boxColor.toUpperCase();
       updateTextPreview();
     });
   }
@@ -1704,12 +2100,51 @@
     textAlign = 'center';
     textEffect = 'none';
 
+    outlineColor = '#000000';
+    outlineWidth = 4;
+    outlineOpacity = 1.0;
+    shadowColor = '#000000';
+    shadowBlur = 12;
+    shadowDist = 4;
+    shadowOpacity = 0.9;
+    glowColor = '#38bdf8';
+    glowRadius = 18;
+    glowOpacity = 1.0;
+    boxColor = '#000000';
+    boxOpacity = 0.72;
+
     if (activeFontTag) activeFontTag.textContent = 'Inter';
     if (activeColorTag) activeColorTag.textContent = '#FFFFFF';
+    if (activeOutlineTag) activeOutlineTag.textContent = '#000000';
+    if (activeShadowTag) activeShadowTag.textContent = '#000000';
+    if (activeGlowTag) activeGlowTag.textContent = '#38BDF8';
+    if (activeBoxTag) activeBoxTag.textContent = '#000000';
+
     if (textSizeSlider) textSizeSlider.value = 38;
     if (textSizeVal) textSizeVal.textContent = '38px';
     if (textOpacitySlider) textOpacitySlider.value = 100;
     if (textOpacityVal) textOpacityVal.textContent = '100%';
+
+    if (outlineWidthSlider) outlineWidthSlider.value = 4;
+    if (outlineWidthVal) outlineWidthVal.textContent = '4px';
+    if (outlineOpacitySlider) outlineOpacitySlider.value = 100;
+    if (outlineOpacityVal) outlineOpacityVal.textContent = '100%';
+
+    if (shadowBlurSlider) shadowBlurSlider.value = 12;
+    if (shadowBlurVal) shadowBlurVal.textContent = '12px';
+    if (shadowDistSlider) shadowDistSlider.value = 4;
+    if (shadowDistVal) shadowDistVal.textContent = '4px';
+    if (shadowOpacitySlider) shadowOpacitySlider.value = 90;
+    if (shadowOpacityVal) shadowOpacityVal.textContent = '90%';
+
+    if (glowRadiusSlider) glowRadiusSlider.value = 18;
+    if (glowRadiusVal) glowRadiusVal.textContent = '18px';
+    if (glowOpacitySlider) glowOpacitySlider.value = 100;
+    if (glowOpacityVal) glowOpacityVal.textContent = '100%';
+
+    if (boxOpacitySlider) boxOpacitySlider.value = 72;
+    if (boxOpacityVal) boxOpacityVal.textContent = '72%';
+
     if (btnTextBold) btnTextBold.classList.remove('active');
     if (btnTextItalic) btnTextItalic.classList.remove('active');
     if (btnTextUnderline) btnTextUnderline.classList.remove('active');
@@ -1759,7 +2194,6 @@
     const realY = textDisplayY * ratio;
 
     bCtx.save();
-    bCtx.globalAlpha = textOpacity;
 
     const fontStylePart = textItalic ? 'italic ' : '';
     const fontWeightPart = textBold ? '800 ' : '600 ';
@@ -1773,7 +2207,7 @@
     const totalBlockHeight = textLines.length * lineHeight;
     const startY = realY - (totalBlockHeight / 2) + (lineHeight / 2);
 
-    // Badge / Box background effect
+    // Badge / Box background effect (Uses independent boxColor and boxOpacity)
     if (textEffect === 'box') {
       let maxLineWidth = 0;
       textLines.forEach(line => {
@@ -1789,7 +2223,7 @@
       else if (textAlign === 'right') boxX = realX - maxLineWidth - padX;
       const boxY = realY - (boxH / 2);
 
-      bCtx.fillStyle = 'rgba(0, 0, 0, 0.72)';
+      bCtx.fillStyle = hexToRgba(boxColor, boxOpacity);
       bCtx.beginPath();
       if (bCtx.roundRect) {
         bCtx.roundRect(boxX, boxY, boxW, boxH, 14 * ratio);
@@ -1799,35 +2233,42 @@
       bCtx.fill();
     }
 
-    // Effect styling: Outline or Shadows
+    // Effect styling: Outline or Shadows or Glow (Isolated properties)
     if (textEffect === 'border') {
-      bCtx.strokeStyle = '#000000';
-      bCtx.lineWidth = Math.max(3, Math.round(3.5 * ratio));
+      bCtx.strokeStyle = hexToRgba(outlineColor, outlineOpacity);
+      bCtx.lineWidth = Math.max(1, Math.round(outlineWidth * ratio));
       bCtx.lineJoin = 'round';
+      bCtx.miterLimit = 2;
       textLines.forEach((line, idx) => {
         const lineY = startY + (idx * lineHeight);
         bCtx.strokeText(line, realX, lineY);
       });
     } else if (textEffect === 'shadow') {
-      bCtx.shadowColor = 'rgba(0, 0, 0, 0.95)';
-      bCtx.shadowBlur = Math.round(14 * ratio);
+      bCtx.shadowColor = hexToRgba(shadowColor, shadowOpacity);
+      bCtx.shadowBlur = Math.round(shadowBlur * ratio);
       bCtx.shadowOffsetX = 0;
-      bCtx.shadowOffsetY = Math.round(4 * ratio);
+      bCtx.shadowOffsetY = Math.round(shadowDist * ratio);
     } else if (textEffect === 'glow') {
-      bCtx.shadowColor = textColor;
-      bCtx.shadowBlur = Math.round(22 * ratio);
+      bCtx.shadowColor = hexToRgba(glowColor, glowOpacity);
+      bCtx.shadowBlur = Math.round(glowRadius * ratio);
     }
 
-    // Draw text fill
-    bCtx.fillStyle = textColor;
+    // Draw text fill with independent fill color and fill opacity
+    bCtx.fillStyle = hexToRgba(textColor, textOpacity);
     textLines.forEach((line, idx) => {
       const lineY = startY + (idx * lineHeight);
       bCtx.fillText(line, realX, lineY);
     });
 
+    // Clear shadow before drawing underline so underline doesn't cast duplicate shadow
+    bCtx.shadowColor = 'transparent';
+    bCtx.shadowBlur = 0;
+    bCtx.shadowOffsetX = 0;
+    bCtx.shadowOffsetY = 0;
+
     // Underline
     if (textUnderline) {
-      bCtx.strokeStyle = textColor;
+      bCtx.strokeStyle = hexToRgba(textColor, textOpacity);
       bCtx.lineWidth = Math.max(2, Math.round(2.5 * ratio));
       textLines.forEach((line, idx) => {
         const lineY = startY + (idx * lineHeight);
